@@ -27,6 +27,17 @@ class Deploy(FileSystemEventHandler):
 
         self.timers = {}
         self.debounce_time = 1.0
+        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync']
+
+    def is_ignored(self, path):
+        """Checks if any part of the path is in the ignore list."""
+
+        path_parts = path.replace("\\", "/").split("/")
+        
+        for ignored_item in self.ignore_list:
+            if ignored_item in path_parts:
+                return True
+        return False
 
 
 
@@ -55,7 +66,7 @@ class Deploy(FileSystemEventHandler):
 
         """Handles creating files and folders to prevent duplicates."""
 
-        if ".DS_Store" in event.src_path or "tmp" in event.src_path:
+        if self.is_ignored(event.src_path):
             return
         
         try:
@@ -76,7 +87,7 @@ class Deploy(FileSystemEventHandler):
         """Handles modifying files and folders to prevent duplicates."""
 
 
-        if event.is_directory or ".DS_Store" in event.src_path or "tmp" in event.src_path:
+        if event.is_directory or self.is_ignored(event.src_path):
 
             return
 
