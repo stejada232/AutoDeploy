@@ -282,6 +282,19 @@ class window(FileSystemEventHandler):
         self.log_queue = queue.Queue()
         self.poll_log_queue()
 
+        # --- 7. Ignore List ---
+        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync']
+
+    def is_ignored(self, path):
+        """Checks if any part of the path is in the ignore list."""
+
+        path_parts = path.replace("\\", "/").split("/")
+        
+        for ignored_item in self.ignore_list:
+            if ignored_item in path_parts:
+                return True
+        return False
+
     def poll_log_queue(self):
         try:
             while True:
@@ -451,6 +464,8 @@ class window(FileSystemEventHandler):
     def check_for_new_remote(self,remote_path):
         new_rem_files = self.sftp.listdir_attr(remote_path)
         for file in new_rem_files:
+            if self.is_ignored(file.filename):
+                continue
             file_remote_path = remote_path + "/" + file.filename
             local_path = self.get_local_path(file_remote_path)
             print(file_remote_path)
