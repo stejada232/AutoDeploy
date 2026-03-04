@@ -279,6 +279,8 @@ class window(FileSystemEventHandler):
         self.lockables = [self.connect, self.disconnect]
         self.sftp = None
         self.sftp_lock = threading.Lock()
+        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync']
+
 
         # --- 6. Log Queue---
         self.log_queue = queue.Queue()
@@ -292,7 +294,7 @@ class window(FileSystemEventHandler):
         except queue.Empty:
             pass
         self.root.after(100, self.poll_log_queue)
-    
+
     def start_connect(self):
         if self.sftp:
             self.log_queue.put("Already connected to a server.")
@@ -437,6 +439,65 @@ class window(FileSystemEventHandler):
             self.refresh_remote_files()
         else:
             return
+    
+    def get_remote_path(self, local_path):
+
+        relative_path = os.path.relpath(local_path, self.current_local_path)
+
+        remote_path = os.path.join(self.current_remote_path, relative_path)
+
+        return remote_path.replace("\\", "/")
+
+    def is_ignored(self, path):
+        """Checks if any part of the path is in the ignore list."""
+
+        path_parts = path.replace("\\", "/").split("/")
+        
+        for ignored_item in self.ignore_list:
+            if ignored_item in path_parts:
+                return True
+        return False
+
+    def search_push_local(self,local_dir):
+        try:
+            for item in os.listdir(local_dir):
+                if self.is_ignored(item):
+                    continue
+
+                local_item_path = os.path.join(local_dir, item).replace("\\", "/")
+                remote_item_path = self.get_remote_path(local_item_path)
+
+                if os.path.isdir(local_item_path):
+                    try:
+                        self.sftp.stat(remote_item_path)
+                    except:
+                        with self.sftp_lock:
+                            self.sftp.mkdir(remote_item_path)
+                        self.log_queue.put(f"Created remote folder: {remote_item_path}")
+                    self.search_push_local(local_item_path)
+                else:
+                    local_time = int(os.path.getmtime(local_item_path))
+                    needs_upload = False
+
+                    try:
+                        remote_time = self.sftp.stat(remote_item_path).st_mtime
+                        if local_time > remote_time:
+                            needs_upload = True
+                    except IOError:
+                        needs_upload = True
+                    
+                    if needs_upload:
+                        with self.sftp_lock:
+                            self.sftp.put(local_item_path,remote_item_path)
+                            self.sftp.utime(remote_item_path, (local_time, local_time))
+                        self.log_queue.put(f"Pushed offline update: {item}")
+        except Exception as e:
+            self.log_queue.put(f"Initial Push Error: {e}")
+
+    def start_full_deploy(self):
+        self.log_queue.put("Pushing offline updates...")
+        self.search_push_local(self.current_local_path)
+        self.root.after(0, self.start_watchdog)
 
     def start_observer(self):
         if not self.sftp:
@@ -451,6 +512,9 @@ class window(FileSystemEventHandler):
         self.local_action_btn.config(state="disabled")
         self.remote_action_btn.config(state="disabled")
         self.is_deploying = True
+        threading.Thread(target=self.start_full_deploy, daemon=True).start()
+
+    def start_watchdog(self):
         self.log_queue.put(f"Watching for changes...")
         safe_refresh = lambda: self.root.after(0, self.refresh_files)
         self.observer = Observer()
@@ -473,24 +537,4 @@ class window(FileSystemEventHandler):
 if __name__ == "__main__":
     root = tk.Tk()
     my_app = window(root)
-
-    # ==========================================
-    # --- DEBUG DEFAULTS (Remove before release) ---
-    # ==========================================
-    
-    # 1. Pre-fill the text boxes
-    my_app.ip.insert(0, "127.0.0.1")
-    my_app.port.insert(0, "22")
-    my_app.user.insert(0, "steven-tejada")
-    my_app.passw.insert(0, "stillop835232") # Put your password here
-
-    # 2. Pre-set the test directories (Update these paths to your test folders)
-    my_app.current_local_path = "/home/steven-tejada/Documents/Coding/Python/LocalTest"
-    my_app.current_remote_path = "/home/steven-tejada/Documents/Coding/Python/ServerTest"
-
-    # 3. Force the left-side listbox to load the local path immediately
-    my_app.refresh_local_files(my_app.current_local_path)
-    
-    # ==========================================
-
     root.mainloop()
