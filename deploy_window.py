@@ -9,6 +9,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import threading
 import queue
+import json
 
 from dotenv import load_dotenv
 
@@ -34,7 +35,7 @@ class Deploy(FileSystemEventHandler):
 
         self.timers = {}
         self.debounce_time = 1.0
-        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync']
+        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync.json']
 
     def is_ignored(self, path):
         """Checks if any part of the path is in the ignore list."""
@@ -52,7 +53,7 @@ class Deploy(FileSystemEventHandler):
 
         relative_path = os.path.relpath(local_path, self.local_path)
 
-        remote_path = os.path.join(self.remote_path, relative_path)
+        remote_path = f"{self.remote_path.rstrip('/')}/{relative_path}"
 
         return remote_path.replace("\\", "/")
 
@@ -169,7 +170,7 @@ class Deploy(FileSystemEventHandler):
             local_time = int(os.path.getmtime(new_path))
             try:
                 remote_time = self.sftp.stat(self.get_remote_path(new_path)).st_mtime
-                if remote_time >= local_time:
+                if remote_time > local_time:
                     self.log_queue.put(f"Sync Error: {os.path.basename(new_path)}")         
                     return
             except IOError:
@@ -187,7 +188,7 @@ class Deploy(FileSystemEventHandler):
 
 
 
-class window(FileSystemEventHandler):
+class window():
     def __init__(self, root):
         self.root = root
         self.root.title("Mini Deploy")
@@ -280,11 +281,17 @@ class window(FileSystemEventHandler):
         self.deployment_container.grid_columnconfigure(0, weight=1)
         self.deployment_container.grid_rowconfigure(1, weight=1)
 
-        self.deploy_btn = tk.Button(self.deployment_container, text="Auto Deploy", command=self.start_observer)
+        self.deploy_btn = tk.Button(self.deployment_container, text="Deploy Local → Remote", command=self.start_observer)
         self.deploy_btn.grid(row=0, column=0, sticky="e") # Sticky west to keep it left-aligned
 
+        self.local_sync_btn = tk.Button(self.deployment_container, text="Sync Local Changes", command=lambda: self.sync_local_to_remote(self.current_local_path))
+        self.local_sync_btn.grid(row=0, column=1, sticky="e")
+
+        self.remote_sync_btn = tk.Button(self.deployment_container, text="Sync Remote Changes", command=lambda: self.sync_remote_to_local(self.current_remote_path))
+        self.remote_sync_btn.grid(row=0, column=2, sticky="e")
+
         self.log = tk.Listbox(self.deployment_container)
-        self.log.grid(row=1, column=0, sticky="nsew")
+        self.log.grid(row=1, column=0, columnspan=3, sticky="nsew")
 
         # --- 5. Paths and Other Stuff---
         self.current_remote_path = "."
@@ -293,13 +300,15 @@ class window(FileSystemEventHandler):
         self.lockables = [self.connect, self.disconnect]
         self.sftp = None
         self.sftp_lock = threading.Lock()
+        self.observer = None
+        self.sync_json = {}
 
         # --- 6. Log Queue---
         self.log_queue = queue.Queue()
         self.poll_log_queue()
 
         # --- 7. Ignore List ---
-        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync']
+        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync.json']
 
     def is_ignored(self, path):
         """Checks if any part of the path is in the ignore list."""
@@ -394,7 +403,7 @@ class window(FileSystemEventHandler):
             if os.path.dirname(path) != path:
                 self.local_fileviewer.insert(tk.END, "    ../")
             for item in items:
-                prefix = "[D] " if os.path.isdir(os.path.join(path, item)) else "[F] "
+                prefix = "[D] " if os.path.isdir(f"{path.rstrip('/')}/{item}") else "[F] "
                 self.local_fileviewer.insert(tk.END, prefix + item)
                 
             self.local_path_label.config(text=f"Local Path: {path}")
@@ -416,7 +425,7 @@ class window(FileSystemEventHandler):
                 for item in items:
                     prefix = "[D] " if stat.S_ISDIR(item.st_mode) else "[F] "
                     self.fileviewer.insert(tk.END, prefix + item.filename)
-                self.remote_path_label.config(text=f"Local Path: {self.current_remote_path}")
+                self.remote_path_label.config(text=f"Remote Path: {self.current_remote_path}")
             except Exception as e:
                 self.log_queue.put(f"Could not list directory {self.current_remote_path}: {e}")
                 self.current_remote_path = os.path.dirname(self.current_remote_path)
@@ -428,7 +437,7 @@ class window(FileSystemEventHandler):
         selection = self.local_fileviewer.get(self.local_fileviewer.curselection())
         name = selection[4:]
         if selection.startswith("[D]"):
-            new_path = os.path.join(self.current_local_path, name).replace("\\", "/")
+            new_path = f"{self.current_local_path.rstrip('/')}/{name}".replace("\\", "/")
             if os.access(new_path, os.R_OK):
                 self.current_local_path = new_path
                 self.refresh_local_files(self.current_local_path)
@@ -449,7 +458,7 @@ class window(FileSystemEventHandler):
         selection = self.fileviewer.get(self.fileviewer.curselection())
         name = selection[4:]
         if selection.startswith("[D]"):
-            target_path = os.path.join(self.current_remote_path, name).replace("\\", "/")
+            target_path = f"{self.current_remote_path.rstrip('/')}/{name}".replace("\\", "/")
             try:
                 self.sftp.listdir(target_path)
                 self.current_remote_path = target_path
@@ -474,34 +483,150 @@ class window(FileSystemEventHandler):
 
         relative_path = os.path.relpath(remote_path, self.current_remote_path)
 
-        local_path = os.path.join(self.current_local_path, relative_path)
+        local_path = f"{self.current_local_path.rstrip('/')}/{relative_path}"
+        
 
         return local_path.replace("\\", "/")
 
-    def check_for_new_remote(self,remote_path):
-        new_rem_files = self.sftp.listdir_attr(remote_path)
-        for file in new_rem_files:
-            if self.is_ignored(file.filename):
-                continue
-            file_remote_path = remote_path + "/" + file.filename
-            local_path = self.get_local_path(file_remote_path)
-            print(file_remote_path)
-            if stat.S_ISDIR(file.st_mode):
-                if not os.path.exists(local_path):
-                    os.makedirs(local_path)
-                self.check_for_new_remote(file_remote_path)
-            else:
-                if not os.path.exists(local_path):
-                    self.sftp.get(file_remote_path,local_path)
-                    os.utime(local_path, (file.st_mtime, file.st_mtime))
-                else:
-                    local_time = int(os.path.getmtime(local_path))
-                    remote_time = file.st_mtime
-                    if local_time < remote_time:
-                        self.sftp.get(file_remote_path, local_path)
-                        os.utime(local_path, (file.st_mtime, file.st_mtime))
+    def get_remote_path(self, local_path):
 
-                        
+        relative_path = os.path.relpath(local_path, self.current_local_path)
+
+        remote_path = f"{self.current_remote_path.rstrip('/')}/{relative_path}"
+
+        return remote_path.replace("\\", "/")
+
+    def sftp_exists(self, file_path):
+        try:
+            self.sftp.stat(file_path)
+            return True
+        except IOError:
+            return False
+
+    def delete_remote_dir(self,remote_path):
+        for entry in self.sftp.listdir_attr(remote_path):
+            full_path = f"{remote_path.rstrip('/')}/{entry.filename}"
+
+            if stat.S_ISDIR(entry.st_mode):
+                self.delete_remote_dir(full_path)
+            else:
+                self.sftp.remove(full_path)
+        self.sftp.rmdir(remote_path)
+
+
+    def sync_local_to_remote(self,local_path):
+        local_files = sorted([f for f in os.scandir(local_path) if not self.is_ignored(f.name)], key=lambda x: x.name)
+        remote_dir_path = self.get_remote_path(local_path)
+        
+        try:
+            remote_files = sorted(
+                [f for f in self.sftp.listdir_attr(remote_dir_path) if not self.is_ignored(f.filename)], 
+                key=lambda x: x.filename
+            )
+        except IOError:
+            remote_files = [] # Directory doesn't exist remotely yet
+        l = 0
+        r = 0
+
+        while l < len(local_files) or r < len(remote_files):
+            l_file = local_files[l] if l < len(local_files) else None
+            r_file = remote_files[r] if r < len(remote_files) else None
+
+            if l_file is not None:
+                file_local_path = l_file.path
+                l_remote_path = self.get_remote_path(file_local_path)
+                local_time = l_file.stat().st_mtime
+            if r_file is not None:
+                remote_time = r_file.st_mtime
+                r_remote_path = f"{remote_dir_path.rstrip('/')}/{r_file.filename}"
+
+            if l_file and r_file and l_file.name == r_file.filename:
+                if l_file.is_dir():
+                    self.sync_local_to_remote(l_file.path)
+                else:
+                    if remote_time < local_time:
+                        self.sftp.put(file_local_path, l_remote_path)
+                        self.sftp.utime(l_remote_path, (local_time, local_time))
+                l+=1
+                r+=1
+
+            elif l_file and (r_file is None or l_file.name < r_file.filename):
+                if l_file.is_dir():
+                    if not self.sftp_exists(l_remote_path):
+                        self.sftp.mkdir(l_remote_path)
+                    self.sync_local_to_remote(l_file.path)
+                else:
+                    self.sftp.put(file_local_path, l_remote_path)
+                    self.sftp.utime(l_remote_path, (local_time, local_time))
+                l+=1
+
+            elif r_file and (l_file is None or r_file.filename < l_file.name):
+                if stat.S_ISDIR(r_file.st_mode):
+                    self.delete_remote_dir(r_remote_path)
+                else:
+                    self.sftp.remove(r_remote_path)
+                r+=1
+      
+    def sync_remote_to_local(self, remote_path):
+        local_dir = self.get_local_path(remote_path)
+        if not os.path.exists(local_dir):
+            os.makedirs(local_dir)
+
+        local_files = sorted([f for f in os.scandir(local_dir) if not self.is_ignored(f.name)], key=lambda x: x.name)
+        with self.sftp_lock:
+            remote_files = sorted([f for f in self.sftp.listdir_attr(remote_path) if not self.is_ignored(f.filename)], key=lambda x: x.filename)
+
+        l = 0
+        r = 0
+
+        while l < len(local_files) or r < len(remote_files):
+            l_file = local_files[l] if l < len(local_files) else None
+            r_file = remote_files[r] if r < len(remote_files) else None
+
+            if r_file is not None:
+                remote_time = r_file.st_mtime
+                file_remote_path = f"{remote_path.rstrip('/')}/{r_file.filename}"
+                r_local_path = self.get_local_path(file_remote_path)
+            
+            if l_file is not None:
+                local_time = l_file.stat().st_mtime
+                l_local_path = l_file.path
+
+            # CASE 1: Match - Item exists on both sides
+            if l_file and r_file and l_file.name == r_file.filename:
+                if stat.S_ISDIR(r_file.st_mode):
+                    self.sync_remote_to_local(file_remote_path)
+                else:
+                    # Sync if remote is newer
+                    if local_time < remote_time:
+                        with self.sftp_lock:
+                            self.sftp.get(file_remote_path, r_local_path)
+                        os.utime(r_local_path, (remote_time, remote_time))
+                l += 1
+                r += 1
+
+            # CASE 2: Remote-only - Item exists on server but not locally
+            elif r_file and (l_file is None or r_file.filename < l_file.name):
+                if stat.S_ISDIR(r_file.st_mode):
+                    if not os.path.exists(r_local_path):
+                        os.makedirs(r_local_path)
+                    self.sync_remote_to_local(file_remote_path)
+                else:
+                    with self.sftp_lock:
+                        self.sftp.get(file_remote_path, r_local_path)
+                    os.utime(r_local_path, (remote_time, remote_time))
+                r += 1
+
+            # CASE 3: Local-only - Item exists locally but not on server (Delete to match remote)
+            elif l_file and (r_file is None or l_file.name < r_file.filename):
+                if l_file.is_dir():
+                    import shutil
+                    shutil.rmtree(l_local_path)
+                else:
+                    os.remove(l_local_path)
+                l += 1
+
+
 
 
 
@@ -513,15 +638,31 @@ class window(FileSystemEventHandler):
             self.log_queue.put(f"Directories not chosen.")
             return
         try:
-            self.sftp.stat(self.current_remote_path+"/.minisync")
+            self.sftp.stat(self.current_remote_path+"/.minisync.json")
         except IOError:
             answer = messagebox.askyesno(title="Add Synchronization?", message="This remote directory is currently not initialized for syncing. Would you like to initialize it?")
             if answer:
-                self.sftp.open(self.current_remote_path+"/.minisync", 'w').close()
+                self.sftp.open(self.current_remote_path+"/.minisync.json", 'w').close()
                 self.log_queue.put(f"Directory initialized")
             else:
                 self.log_queue.put(f"Deployment failed")
                 return
+        # self.sync_json={}
+        # self.add_to_sync_json(self.current_remote_path)
+        # print(self.sync_json)
+        # database_path = os.path.join(self.current_remote_path, ".minisync.json")
+        # if os.path.exists(database_path) and os.path.getsize(database_path)>0:
+        #     with open(database_path, "r") as f:
+        #         try:
+        #             data = json.load(f)
+        #         except json.JSONDecodeError:
+        #             data = {}
+        # else:
+        #     data = {}
+        # data.update(self.sync_json)
+        # with self.sftp_lock:
+        #     with self.sftp.file(database_path, 'w') as f:
+        #         json.dump(data, f, indent=4)
         self.deploy_btn.config(text="Stop Deploy",command=self.closing)
         self.connect.config(state="disabled")
         self.disconnect.config(state="disabled")
