@@ -10,90 +10,70 @@ from watchdog.events import FileSystemEventHandler
 import threading
 import queue
 import json
+import shutil
+import posixpath
+
+
 
 from dotenv import load_dotenv
-
 load_dotenv()
+
+IGNORE_LIST = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync.json']
+
+def is_ignored(path):
+    path_parts = path.replace("\\", "/").split("/")
+    return any(ignored_item in path_parts for ignored_item in IGNORE_LIST)
 
 
 class Deploy(FileSystemEventHandler):
 
-    def __init__(self, sftp, local_path, remote_path, log_queue, sftp_lock, refresh_callback):
+    def __init__(self, app):
 
         super().__init__()
 
-        self.sftp = sftp
-
-        self.local_path = local_path
-
-        self.remote_path = remote_path
-
-        self.log_queue = log_queue
-
-        self.sftp_lock = sftp_lock
-        self.refresh_callback = refresh_callback
+        self.app = app
 
         self.timers = {}
-        self.debounce_time = 1.0
-        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync.json']
-
-    def is_ignored(self, path):
-        """Checks if any part of the path is in the ignore list."""
-
-        path_parts = path.replace("\\", "/").split("/")
-        
-        for ignored_item in self.ignore_list:
-            if ignored_item in path_parts:
-                return True
-        return False
-
-
-
-    def get_remote_path(self, local_path):
-
-        relative_path = os.path.relpath(local_path, self.local_path)
-
-        remote_path = f"{self.remote_path.rstrip('/')}/{relative_path}"
-
-        return remote_path.replace("\\", "/")
+        self.debounce_time = 1000
 
     def create_remote_dir_r(self,remote_path):
         if remote_path=="/" or remote_path=="":
             return
         try:
-            with self.sftp_lock:
-                self.sftp.stat(remote_path)
+            with self.app.sftp_lock:
+                self.app.sftp.stat(remote_path)
         except IOError:
             self.create_remote_dir_r(os.path.dirname(remote_path))
             try:
-                with self.sftp_lock:
-                    self.sftp.mkdir(remote_path)
-                self.log_queue.put(f"Created directory: {remote_path}")
-            except:
-                pass
+                with self.app.sftp_lock:
+                    self.app.sftp.mkdir(remote_path)
+                self.app.log_queue.put(f"Created directory: {remote_path}")
+            except Exception as e:
+                self.app.log_queue.put(f"Could not create directory: {remote_path} - {e}")
+
 
     def on_created(self, event):
 
         """Handles creating files and folders to prevent duplicates."""
 
-        if self.is_ignored(event.src_path):
+        if is_ignored(event.src_path):
             return
         
         try:
-            remote_path = self.get_remote_path(event.src_path)
+            remote_path = self.app.get_remote_path(event.src_path)
 
             if event.is_directory:
                 self.create_remote_dir_r(os.path.dirname(remote_path))
-                with self.sftp_lock:
-                    self.sftp.mkdir(remote_path)
+                with self.app.sftp_lock:
+                    self.app.sftp.mkdir(remote_path)
                     
-                self.log_queue.put(f"Created: {remote_path}")
+                self.app.log_queue.put(f"Created: {remote_path}")
                 
-                self.refresh_callback()
+                self.app.root.after(0, self.app.refresh_files)
             else:
                 self.debounce_upload(event.src_path)
         except Exception as e:
-            self.log_queue.put(f"Create Error: {e}")
+            self.app.log_queue.put(f"Create Error: {e}")
 
 
     def on_modified(self, event):
@@ -101,7 +81,7 @@ class Deploy(FileSystemEventHandler):
         """Handles modifying files and folders to prevent duplicates."""
 
 
-        if event.is_directory or self.is_ignored(event.src_path):
+        if event.is_directory or is_ignored(event.src_path):
 
             return
 
@@ -111,57 +91,57 @@ class Deploy(FileSystemEventHandler):
     def on_moved(self, event):
 
         """Handles renaming files and folders to prevent duplicates."""
-        if self.is_ignored(event.src_path) or self.is_ignored(event.dest_path):
+        if is_ignored(event.src_path) or is_ignored(event.dest_path):
             return
         try:
 
-            old_remote = self.get_remote_path(event.src_path)
+            old_remote = self.app.get_remote_path(event.src_path)
 
-            new_remote = self.get_remote_path(event.dest_path)
+            new_remote = self.app.get_remote_path(event.dest_path)
 
-            with self.sftp_lock:
-                self.sftp.rename(old_remote, new_remote)
+            with self.app.sftp_lock:
+                self.app.sftp.rename(old_remote, new_remote)
 
-            self.log_queue.put(f"Renamed: {os.path.basename(event.src_path)} -> {os.path.basename(event.dest_path)}")
+            self.app.log_queue.put(f"Renamed: {os.path.basename(event.src_path)} -> {os.path.basename(event.dest_path)}")
             
-            self.refresh_callback()
+            self.app.root.after(0, self.app.refresh_files)
 
         except Exception as e:
 
-            self.log_queue.put(f"Rename Error: {e}")
+            self.app.log_queue.put(f"Rename Error: {e}")
 
 
 
     def on_deleted(self, event):
 
         """Handles deleting files and folders on the remote server."""
-        if self.is_ignored(event.src_path):
+        if is_ignored(event.src_path):
             return
         try:
 
-            remote_path = self.get_remote_path(event.src_path)
+            remote_path = self.app.get_remote_path(event.src_path)
 
-            with self.sftp_lock:
+            with self.app.sftp_lock:
                 if event.is_directory:
-                    self.sftp.rmdir(remote_path)
-                    self.log_queue.put(f"Deleted Folder: {remote_path}")
+                    self.app.sftp.rmdir(remote_path)
+                    self.app.log_queue.put(f"Deleted Folder: {remote_path}")
                 else:
-                    self.sftp.remove(remote_path)
-                    self.log_queue.put(f"Deleted File: {remote_path}")
+                    self.app.sftp.remove(remote_path)
+                    self.app.log_queue.put(f"Deleted File: {remote_path}")
             
-            self.refresh_callback()
+            self.app.root.after(0, self.app.refresh_files)
+            
 
         except Exception as e:
 
-            self.log_queue.put(f"Delete Error: {e}")
+            self.app.log_queue.put(f"Delete Error: {e}")
 
 
     def debounce_upload(self, new_path):
         if new_path in self.timers:
-            self.timers[new_path].cancel()
-        timer = threading.Timer(self.debounce_time, self.process_upload, args=[new_path])
-        self.timers[new_path] = timer
-        timer.start()
+            self.app.root.after_cancel(self.timers[new_path])
+        timer_id = self.app.root.after(self.debounce_time, self.process_upload, new_path)
+        self.timers[new_path] = timer_id
 
     def process_upload(self, new_path):
         if new_path in self.timers:
@@ -169,26 +149,28 @@ class Deploy(FileSystemEventHandler):
         try:
             local_time = int(os.path.getmtime(new_path))
             try:
-                remote_time = self.sftp.stat(self.get_remote_path(new_path)).st_mtime
+                with self.app.sftp_lock:
+                    remote_time = self.app.sftp.stat(self.app.get_remote_path(new_path)).st_mtime
                 if remote_time > local_time:
-                    self.log_queue.put(f"Sync Error: {os.path.basename(new_path)}")         
+                    self.app.log_queue.put(f"Sync Error: {os.path.basename(new_path)}")         
                     return
             except IOError:
-                pass
-            remote_path = self.get_remote_path(new_path)
+                self.app.log_queue.put(f"Sync Error: {os.path.basename(new_path)}")
+                return
+            remote_path = self.app.get_remote_path(new_path)
             self.create_remote_dir_r(os.path.dirname(remote_path))
-            with self.sftp_lock:
-                self.sftp.put(new_path, remote_path)
-                self.sftp.utime(remote_path, (local_time, local_time))
+            with self.app.sftp_lock:
+                self.app.sftp.put(new_path, remote_path)
+                self.app.sftp.utime(remote_path, (local_time, local_time))
 
-            self.log_queue.put(f"Modified: {os.path.basename(new_path)}") 
-            self.refresh_callback()        
+            self.app.log_queue.put(f"Modified: {os.path.basename(new_path)}") 
+            self.app.root.after(0, self.app.refresh_files)        
         except Exception as e:
-            self.log_queue.put(f"Upload Error: {e}")
+            self.app.log_queue.put(f"Upload Error: {e}")
 
 
 
-class window():
+class Window:
     def __init__(self, root):
         self.root = root
         self.root.title("Mini Deploy")
@@ -281,44 +263,33 @@ class window():
         self.deployment_container.grid_columnconfigure(0, weight=1)
         self.deployment_container.grid_rowconfigure(1, weight=1)
 
-        self.deploy_btn = tk.Button(self.deployment_container, text="Deploy Local → Remote", command=self.start_observer)
-        self.deploy_btn.grid(row=0, column=0, sticky="e") # Sticky west to keep it left-aligned
+        self.deploy_btn_ltr = tk.Button(self.deployment_container, text="Deploy Local → Remote", command=self.start_observer_ltr)
+        self.deploy_btn_ltr.grid(row=0, column=0, sticky="e") 
 
-        self.local_sync_btn = tk.Button(self.deployment_container, text="Sync Local Changes", command=lambda: self.sync_local_to_remote(self.current_local_path))
-        self.local_sync_btn.grid(row=0, column=1, sticky="e")
+        self.deploy_btn_rtl = tk.Button(self.deployment_container, text="Deploy Remote → Local", command=self.start_observer_rtl)
+        self.deploy_btn_rtl.grid(row=0, column=1, sticky="e") 
 
-        self.remote_sync_btn = tk.Button(self.deployment_container, text="Sync Remote Changes", command=lambda: self.sync_remote_to_local(self.current_remote_path))
-        self.remote_sync_btn.grid(row=0, column=2, sticky="e")
+        self.local_sync_btn = tk.Button(self.deployment_container, text="Sync Local Changes", command=lambda: self.ask_sync_ltr(self.current_local_path))
+        self.local_sync_btn.grid(row=0, column=2, sticky="e")
+
+        self.remote_sync_btn = tk.Button(self.deployment_container, text="Sync Remote Changes", command=lambda: self.ask_sync_rtl(self.current_remote_path))
+        self.remote_sync_btn.grid(row=0, column=3, sticky="e")
 
         self.log = tk.Listbox(self.deployment_container)
-        self.log.grid(row=1, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=1, column=0, columnspan=4, sticky="nsew")
 
         # --- 5. Paths and Other Stuff---
         self.current_remote_path = "."
         self.current_local_path = None
-        self.is_deploying = False
-        self.lockables = [self.connect, self.disconnect]
+        self.is_deploying_ltr = False
+        self.is_deploying_rtl = False
         self.sftp = None
         self.sftp_lock = threading.Lock()
         self.observer = None
-        self.sync_json = {}
 
         # --- 6. Log Queue---
         self.log_queue = queue.Queue()
         self.poll_log_queue()
-
-        # --- 7. Ignore List ---
-        self.ignore_list = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync.json']
-
-    def is_ignored(self, path):
-        """Checks if any part of the path is in the ignore list."""
-
-        path_parts = path.replace("\\", "/").split("/")
-        
-        for ignored_item in self.ignore_list:
-            if ignored_item in path_parts:
-                return True
-        return False
 
     def poll_log_queue(self):
         try:
@@ -364,8 +335,10 @@ class window():
         self.refresh_remote_files()
 
     def end_connect(self):
-        if self.is_deploying:
-            self.closing()
+        if self.is_deploying_ltr:
+            self.closing_ltr()
+        if self.is_deploying_rtl:
+            self.closing_rtl()
         if self.sftp:
             self.disconnect.config(state="disabled")
             self.sftp.close()
@@ -377,7 +350,7 @@ class window():
             self.log_queue.put("Disconnected")
 
     def open_folder(self):
-        if self.is_deploying:
+        if self.is_deploying_ltr or self.is_deploying_rtl:
             self.log_queue.put("Stop deployment before changing folders!")
         selected_directory = filedialog.askdirectory(
             initialdir="/", 
@@ -403,7 +376,7 @@ class window():
             if os.path.dirname(path) != path:
                 self.local_fileviewer.insert(tk.END, "    ../")
             for item in items:
-                prefix = "[D] " if os.path.isdir(f"{path.rstrip('/')}/{item}") else "[F] "
+                prefix = "[D] " if os.path.isdir(os.path.join(path, item)) else "[F] "
                 self.local_fileviewer.insert(tk.END, prefix + item)
                 
             self.local_path_label.config(text=f"Local Path: {path}")
@@ -432,12 +405,12 @@ class window():
 
         
     def on_local_double_click(self, event):
-        if not self.local_fileviewer.curselection() or self.is_deploying:
+        if not self.local_fileviewer.curselection() or self.is_deploying_ltr or self.is_deploying_rtl:
             return
         selection = self.local_fileviewer.get(self.local_fileviewer.curselection())
         name = selection[4:]
         if selection.startswith("[D]"):
-            new_path = f"{self.current_local_path.rstrip('/')}/{name}".replace("\\", "/")
+            new_path = os.path.join(self.current_local_path,name)
             if os.access(new_path, os.R_OK):
                 self.current_local_path = new_path
                 self.refresh_local_files(self.current_local_path)
@@ -453,12 +426,12 @@ class window():
             return
 
     def on_remote_double_click(self, event):
-        if not self.fileviewer.curselection() or self.is_deploying:
+        if not self.fileviewer.curselection() or self.is_deploying_ltr or self.is_deploying_rtl:
             return
         selection = self.fileviewer.get(self.fileviewer.curselection())
         name = selection[4:]
         if selection.startswith("[D]"):
-            target_path = f"{self.current_remote_path.rstrip('/')}/{name}".replace("\\", "/")
+            target_path = posixpath.join(self.current_remote_path, name)
             try:
                 self.sftp.listdir(target_path)
                 self.current_remote_path = target_path
@@ -475,26 +448,21 @@ class window():
             return
 
     def polling_loop(self):
-        while self.is_deploying:
-            self.check_for_new_remote(self.current_remote_path)
-            time.sleep(10)
+        while self.is_deploying_rtl:
+            self.sync_remote_to_local(self.current_remote_path)
+            time.sleep(45)
     
     def get_local_path(self, remote_path):
 
         relative_path = os.path.relpath(remote_path, self.current_remote_path)
 
-        local_path = f"{self.current_local_path.rstrip('/')}/{relative_path}"
+        return os.path.join(self.current_local_path, relative_path.replace("\\", "/"))
         
-
-        return local_path.replace("\\", "/")
-
     def get_remote_path(self, local_path):
 
         relative_path = os.path.relpath(local_path, self.current_local_path)
 
-        remote_path = f"{self.current_remote_path.rstrip('/')}/{relative_path}"
-
-        return remote_path.replace("\\", "/")
+        return posixpath.join(self.current_remote_path, relative_path.replace("\\", "/"))
 
     def sftp_exists(self, file_path):
         try:
@@ -504,23 +472,45 @@ class window():
             return False
 
     def delete_remote_dir(self,remote_path):
-        for entry in self.sftp.listdir_attr(remote_path):
-            full_path = f"{remote_path.rstrip('/')}/{entry.filename}"
+        with self.sftp_lock:
+            entries = self.sftp.listdir_attr(remote_path)
+        for entry in entries:
+            full_path = posixpath.join(remote_path, entry.filename)
 
             if stat.S_ISDIR(entry.st_mode):
                 self.delete_remote_dir(full_path)
             else:
-                self.sftp.remove(full_path)
-        self.sftp.rmdir(remote_path)
+                with self.sftp_lock:
+                    self.sftp.remove(full_path)
+        with self.sftp_lock:
+            self.sftp.rmdir(remote_path)
 
+    def toggle_ui(self, state):
+        """Pass 'normal' or 'disabled' to lock/unlock core UI elements."""
+        self.connect.config(state=state)
+        self.disconnect.config(state=state)
+        self.local_action_btn.config(state=state)
+        self.remote_action_btn.config(state=state)
+        self.local_sync_btn.config(state=state)
+        self.remote_sync_btn.config(state=state)
+
+    def ask_sync_ltr(self, local_path):
+        if messagebox.askyesno("Confirmation", "Are you sure you want to replace all files in the remote directory with the files in your local directory?"):
+            self.sync_local_to_remote(local_path)
+
+    def ask_sync_rtl(self, remote_path):
+        if messagebox.askyesno("Confirmation", "Are you sure you want to replace all files in the local directory with the files in your remote directory?"):
+            self.sync_remote_to_local(remote_path)
 
     def sync_local_to_remote(self,local_path):
-        local_files = sorted([f for f in os.scandir(local_path) if not self.is_ignored(f.name)], key=lambda x: x.name)
+        local_files = sorted([f for f in os.scandir(local_path) if not is_ignored(f.name)], key=lambda x: x.name)
         remote_dir_path = self.get_remote_path(local_path)
-        
+        with self.sftp_lock:
+            remote_dir_attr = self.sftp.listdir_attr(remote_dir_path)
+
         try:
             remote_files = sorted(
-                [f for f in self.sftp.listdir_attr(remote_dir_path) if not self.is_ignored(f.filename)], 
+                [f for f in remote_dir_attr if not is_ignored(f.filename)], 
                 key=lambda x: x.filename
             )
         except IOError:
@@ -538,42 +528,57 @@ class window():
                 local_time = l_file.stat().st_mtime
             if r_file is not None:
                 remote_time = r_file.st_mtime
-                r_remote_path = f"{remote_dir_path.rstrip('/')}/{r_file.filename}"
+                r_remote_path = posixpath.join(remote_dir_path,r_file.filename)
 
             if l_file and r_file and l_file.name == r_file.filename:
-                if l_file.is_dir():
-                    self.sync_local_to_remote(l_file.path)
-                else:
-                    if remote_time < local_time:
+                if stat.S_ISDIR(r_file.st_mode) and not l_file.is_dir():
+                    self.delete_remote_dir(r_remote_path)
+                    with self.sftp_lock:
                         self.sftp.put(file_local_path, l_remote_path)
                         self.sftp.utime(l_remote_path, (local_time, local_time))
+                elif not stat.S_ISDIR(r_file.st_mode) and l_file.is_dir():
+                    with self.sftp_lock:
+                        self.sftp.remove(r_remote_path)
+                    self.sync_local_to_remote(l_file.path)
+                elif not stat.S_ISDIR(r_file.st_mode) and not l_file.is_dir():
+                    if local_time > remote_time or r_file.st_size != l_file.stat().st_size:
+                        with self.sftp_lock:
+                            self.sftp.put(file_local_path, l_remote_path)
+                            self.sftp.utime(l_remote_path, (local_time, local_time))
+                else:
+                    self.sync_local_to_remote(l_file.path)
                 l+=1
                 r+=1
 
             elif l_file and (r_file is None or l_file.name < r_file.filename):
                 if l_file.is_dir():
-                    self.sftp.mkdir(l_remote_path)
+                    with self.sftp_lock:
+                        self.sftp.mkdir(l_remote_path)
                     self.sync_local_to_remote(l_file.path)
                 else:
-                    self.sftp.put(file_local_path, l_remote_path)
-                    self.sftp.utime(l_remote_path, (local_time, local_time))
+                    with self.sftp_lock:
+                        self.sftp.put(file_local_path, l_remote_path)
+                        self.sftp.utime(l_remote_path, (local_time, local_time))
                 l+=1
 
             elif r_file and (l_file is None or r_file.filename < l_file.name):
                 if stat.S_ISDIR(r_file.st_mode):
                     self.delete_remote_dir(r_remote_path)
                 else:
-                    self.sftp.remove(r_remote_path)
+                    with self.sftp_lock:
+                        self.sftp.remove(r_remote_path)
                 r+=1
-      
+        self.root.after(0, self.refresh_files)
+
+
     def sync_remote_to_local(self, remote_path):
         local_dir = self.get_local_path(remote_path)
         if not os.path.exists(local_dir):
             os.makedirs(local_dir)
 
-        local_files = sorted([f for f in os.scandir(local_dir) if not self.is_ignored(f.name)], key=lambda x: x.name)
+        local_files = sorted([f for f in os.scandir(local_dir) if not is_ignored(f.name)], key=lambda x: x.name)
         with self.sftp_lock:
-            remote_files = sorted([f for f in self.sftp.listdir_attr(remote_path) if not self.is_ignored(f.filename)], key=lambda x: x.filename)
+            remote_files = sorted([f for f in self.sftp.listdir_attr(remote_path) if not is_ignored(f.filename)], key=lambda x: x.filename)
 
         l = 0
         r = 0
@@ -584,7 +589,7 @@ class window():
 
             if r_file is not None:
                 remote_time = r_file.st_mtime
-                file_remote_path = f"{remote_path.rstrip('/')}/{r_file.filename}"
+                file_remote_path = posixpath.join(remote_path,r_file.filename)
                 r_local_path = self.get_local_path(file_remote_path)
             
             if l_file is not None:
@@ -592,13 +597,22 @@ class window():
                 l_local_path = l_file.path
 
             if l_file and r_file and l_file.name == r_file.filename:
-                if stat.S_ISDIR(r_file.st_mode):
+                if stat.S_ISDIR(r_file.st_mode) and not l_file.is_dir():
+                    os.remove(l_local_path)
+                    os.makedirs(r_local_path)
                     self.sync_remote_to_local(file_remote_path)
-                else:
-                    if local_time < remote_time:
+                elif not stat.S_ISDIR(r_file.st_mode) and l_file.is_dir():
+                    shutil.rmtree(l_local_path)
+                    with self.sftp_lock:
+                        self.sftp.get(file_remote_path, r_local_path)
+                    os.utime(r_local_path, (remote_time, remote_time))
+                elif not stat.S_ISDIR(r_file.st_mode) and not l_file.is_dir():
+                    if remote_time > local_time or r_file.st_size != l_file.stat().st_size:
                         with self.sftp_lock:
                             self.sftp.get(file_remote_path, r_local_path)
                         os.utime(r_local_path, (remote_time, remote_time))
+                else:
+                    self.sync_remote_to_local(file_remote_path)
                 l += 1
                 r += 1
 
@@ -615,78 +629,68 @@ class window():
 
             elif l_file and (r_file is None or l_file.name < r_file.filename):
                 if l_file.is_dir():
-                    import shutil
                     shutil.rmtree(l_local_path)
                 else:
                     os.remove(l_local_path)
                 l += 1
 
+        self.root.after(0, self.refresh_files)
 
 
-
-
-    def start_observer(self):
+    def start_observer_shared(self):
         if not self.sftp:
             self.log_queue.put(f"Connection not established.")
-            return
+            return False
         if not self.current_local_path or not self.current_remote_path:
             self.log_queue.put(f"Directories not chosen.")
+            return False
+        self.toggle_ui("disabled")
+        return True
+
+
+    def start_observer_ltr(self):
+        if not self.start_observer_shared() or self.is_deploying_rtl:
             return
-        try:
-            self.sftp.stat(self.current_remote_path+"/.minisync.json")
-        except IOError:
-            answer = messagebox.askyesno(title="Add Synchronization?", message="This remote directory is currently not initialized for syncing. Would you like to initialize it?")
-            if answer:
-                self.sftp.open(self.current_remote_path+"/.minisync.json", 'w').close()
-                self.log_queue.put(f"Directory initialized")
-            else:
-                self.log_queue.put(f"Deployment failed")
-                return
-        # self.sync_json={}
-        # self.add_to_sync_json(self.current_remote_path)
-        # print(self.sync_json)
-        # database_path = os.path.join(self.current_remote_path, ".minisync.json")
-        # if os.path.exists(database_path) and os.path.getsize(database_path)>0:
-        #     with open(database_path, "r") as f:
-        #         try:
-        #             data = json.load(f)
-        #         except json.JSONDecodeError:
-        #             data = {}
-        # else:
-        #     data = {}
-        # data.update(self.sync_json)
-        # with self.sftp_lock:
-        #     with self.sftp.file(database_path, 'w') as f:
-        #         json.dump(data, f, indent=4)
-        self.deploy_btn.config(text="Stop Deploy",command=self.closing)
-        self.connect.config(state="disabled")
-        self.disconnect.config(state="disabled")
-        self.local_action_btn.config(state="disabled")
-        self.remote_action_btn.config(state="disabled")
-        self.is_deploying = True
-        threading.Thread(target=self.polling_loop, daemon=True).start()
-        self.log_queue.put(f"Watching for changes...")
+        self.deploy_btn_rtl.config(state="disabled")
+        self.is_deploying_ltr = True
+        self.deploy_btn_ltr.config(text="Stop Deploy",command=self.closing_ltr)
+        self.log_queue.put(f"Watching for changes from local...")
         safe_refresh = lambda: self.root.after(0, self.refresh_files)
         self.observer = Observer()
-        self.observer.schedule(Deploy(self.sftp, self.current_local_path,self.current_remote_path,self.log_queue, self.sftp_lock, safe_refresh), self.current_local_path, recursive=True)
+        self.observer.schedule(Deploy(self), self.current_local_path, recursive=True)
         self.observer.start()
 
-    def closing(self):
-        if self.observer or self.is_deploying:
-            self.connect.config(state="normal")
-            self.disconnect.config(state="normal")
-            self.local_action_btn.config(state="normal")
-            self.remote_action_btn.config(state="normal")
+    def start_observer_rtl(self):
+        if not self.start_observer_shared() or self.is_deploying_ltr:
+            return
+        self.deploy_btn_ltr.config(state="disabled")
+        self.is_deploying_rtl = True
+        self.deploy_btn_rtl.config(text="Stop Deploy",command=self.closing_rtl)
+        threading.Thread(target=self.polling_loop, daemon=True).start()
+        self.log_queue.put(f"Watching for changes from remote...")
+
+    def closing_ltr(self):
+        if self.observer or self.is_deploying_ltr:
+            self.toggle_ui("normal")
             self.observer.stop()
             self.observer.join()
-            self.deploy_btn.config(text = "Auto Deploy",command = self.start_observer)
-            self.log_queue.put("Stopped Deployment")
-            self.is_deploying = False
+            self.deploy_btn_rtl.config(state="normal")
+            self.deploy_btn_ltr.config(text = "Deploy Local → Remote",command = self.start_observer_ltr)
+            self.log_queue.put("Stopped Deployment from Local to Remote")
+            self.is_deploying_ltr = False
             self.observer = None
+
+    def closing_rtl(self):
+        if self.is_deploying_rtl:
+            self.toggle_ui("normal")
+            self.deploy_btn_ltr.config(state="normal")
+            self.deploy_btn_rtl.config(text = "Deploy Remote → Local",command = self.start_observer_rtl)
+            self.log_queue.put("Stopped Deployment from Remote to Local")
+            self.is_deploying_rtl = False
         
 if __name__ == "__main__":
     root = tk.Tk()
-    my_app = window(root)
+    my_app = Window(root)
     # ==========================================
     # --- SAFE DEBUG DEFAULTS ---
     # ==========================================
