@@ -1,6 +1,5 @@
 import tkinter as tk
 from tkinter import messagebox, filedialog
-import sys
 import time
 import os
 import stat
@@ -9,14 +8,8 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import threading
 import queue
-import json
 import shutil
 import posixpath
-
-
-
-from dotenv import load_dotenv
-load_dotenv()
 
 IGNORE_LIST = ['.git', '.DS_Store', '__pycache__', '.venv', 'node_modules', '.minisync.json']
 
@@ -539,6 +532,7 @@ class Window:
                 elif not stat.S_ISDIR(r_file.st_mode) and l_file.is_dir():
                     with self.sftp_lock:
                         self.sftp.remove(r_remote_path)
+                        self.sftp.mkdir(l_remote_path)
                     self.sync_local_to_remote(l_file.path)
                 elif not stat.S_ISDIR(r_file.st_mode) and not l_file.is_dir():
                     if local_time > remote_time or r_file.st_size != l_file.stat().st_size:
@@ -691,23 +685,4 @@ class Window:
 if __name__ == "__main__":
     root = tk.Tk()
     my_app = Window(root)
-    # ==========================================
-    # --- SAFE DEBUG DEFAULTS ---
-    # ==========================================
-    
-    # Safely pull credentials from the local .env file. 
-    # The second argument (e.g., "") is a fallback just in case the .env file is missing.
-    my_app.ip.insert(0, os.getenv("TEST_IP", "127.0.0.1"))
-    my_app.port.insert(0, os.getenv("TEST_PORT", "22"))
-    my_app.user.insert(0, os.getenv("TEST_USER", ""))
-    my_app.passw.insert(0, os.getenv("TEST_PASS", "")) 
-
-    my_app.current_local_path = os.getenv("TEST_LOCAL_PATH", ".")
-    my_app.current_remote_path = os.getenv("TEST_REMOTE_PATH", ".")
-
-    # Force the left-side listbox to load the local path immediately
-    if my_app.current_local_path != ".":
-        my_app.refresh_local_files(my_app.current_local_path)
-    
-    # ==========================================
     root.mainloop()
